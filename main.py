@@ -3,9 +3,15 @@ from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.responses import FileResponse
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
-import subprocess, sys, os, tempfile
+import subprocess, sys, os, tempfile, logging
 from pymongo import MongoClient
 import requests
+
+# -------------------------------
+# Logging
+# -------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("YT-Telegram-API")
 
 # -------------------------------
 # Load environment variables
@@ -48,13 +54,17 @@ def run_yt_dlp(args: list):
     cmd = [sys.executable, "-m", "yt_dlp"] + args
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise Exception(f"yt-dlp run failed: {result.stderr}")
-    return result.stdout
+        logger.error(result.stderr)
+        raise Exception(f"yt-dlp failed: {result.stderr}")
+    return result.stdout.strip()
 
 # -------------------------------
 # Helper: Upload to Telegram
 # -------------------------------
 def send_to_telegram(file_path, caption=None):
+    file_size = os.path.getsize(file_path)
+    if file_size > 50*1024*1024:
+        raise HTTPException(status_code=400, detail="File size exceeds 50MB limit")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAudio"
     with open(file_path, "rb") as f:
         files = {"audio": f}
@@ -63,29 +73,37 @@ def send_to_telegram(file_path, caption=None):
     return r.json()
 
 # -------------------------------
+# Internal YouTube search function
+# -------------------------------
+def youtube_search(query):
+    request = youtube.search().list(
+        part="snippet",
+        q=query,
+        maxResults=5,
+        type="video"
+    )
+    response = request.execute()
+    results = []
+    for item in response.get("items", []):
+        results.append({
+            "title": item["snippet"]["title"],
+            "videoId": item["id"]["videoId"],
+            "url": f"https://www.youtube.com/watch?v={item['id']['videoId']}"
+        })
+    return results
+
+# -------------------------------
 # /yt_search endpoint
 # -------------------------------
 @app.get("/yt_search")
-def yt_search(query: str = Query(...), api_key: str = Header(None)):
+def yt_search_endpoint(query: str = Query(...), api_key: str = Header(None)):
     if api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
     try:
-        request = youtube.search().list(
-            part="snippet",
-            q=query,
-            maxResults=5,
-            type="video"
-        )
-        response = request.execute()
-        results = []
-        for item in response.get("items", []):
-            results.append({
-                "title": item["snippet"]["title"],
-                "videoId": item["id"]["videoId"],
-                "url": f"https://www.youtube.com/watch?v={item['id']['videoId']}"
-            })
+        results = youtube_search(query)
         return {"results": results}
     except Exception as e:
+        logger.error(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------
@@ -114,6 +132,7 @@ def get_info(url: str = Query(...), api_key: str = Header(None)):
             "thumbnail": item["snippet"]["thumbnails"]["high"]["url"]
         }
     except Exception as e:
+        logger.error(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------
@@ -125,31 +144,30 @@ def stream(url: str = Query(None), query: str = Query(None), api_key: str = Head
         raise HTTPException(status_code=403, detail="Invalid API Key")
     try:
         if query:
-            search_res = yt_search(query, api_key=API_KEY)
-            if not search_res["results"]:
+            search_res = youtube_search(query)
+            if not search_res:
                 raise HTTPException(status_code=404, detail="No video found")
-            url = search_res["results"][0]["url"]
+            url = search_res[0]["url"]
 
         if not url:
             raise HTTPException(status_code=400, detail="You must provide url or query")
 
-        # Get audio URL using yt-dlp
         output = run_yt_dlp([
             "-f", "bestaudio",
             "--no-playlist",
             "--get-url",
             url
         ])
-        
-        # Log to MongoDB
-        collection.insert_one({"url": url, "direct_url": output.strip()})
 
-        return {"direct_url": output.strip(), "youtube_url": url}
+        collection.insert_one({"url": url, "direct_url": output})
+
+        return {"direct_url": output, "youtube_url": url}
     except Exception as e:
+        logger.error(e)
         raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------
-# /download endpoint (MP3 + Telegram upload)
+# /download endpoint
 # -------------------------------
 @app.get("/download")
 def download_mp3(url: str = Query(...), api_key: str = Header(None)):
@@ -170,9 +188,9 @@ def download_mp3(url: str = Query(...), api_key: str = Header(None)):
             raise HTTPException(status_code=500, detail="MP3 not found")
         mp3_path = os.path.join(temp_dir, files[0])
 
-        # Send to Telegram
         send_to_telegram(mp3_path, caption=files[0])
 
         return FileResponse(mp3_path, filename=files[0], media_type="audio/mpeg")
     except Exception as e:
+        logger.error(e)
         raise HTTPException(status_code=500, detail=str(e))
