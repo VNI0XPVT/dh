@@ -1,4 +1,9 @@
 fastapi
-uvicorn[standard]
+uvicorn
 yt-dlp
-python-multipart
+python-dotenv
+google-api-python-client
+requests
+pyrogram
+tgcrypto
+pytgcalls
